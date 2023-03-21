@@ -68,8 +68,7 @@ It evaluates the performance of single GPU.
            inflating: batch/batch1024.part1
            inflating: batch/batch1024.part2
 2. Launch test.
-         
-         cd ../..
+
          bash launch_test.sh
    The final output should be something like this. (ignoring all logs)
 
@@ -80,6 +79,8 @@ It evaluates the performance of single GPU.
 ## 4. EfficientZero Multi Card DDP Test 
 In this test, the test program runs training part of EfficientZero with multiple DDP workers.
 It evaluates the performance of single GPU as well as communication speed between multiple GPUs.
+Note that torch amp is enabled in this test.
+
 1. Install MCTS tree from cpp source code.
    
          cd test_3_EfficientZero_multi_card_ddp/core/ctree/
@@ -97,13 +98,11 @@ It evaluates the performance of single GPU as well as communication speed betwee
            inflating: batch/batch1024.part1
            inflating: batch/batch1024.part2
 2. Launch test. If the machine has four cards, use
-         
-         cd ../..
+
          bash launch_test_4card.sh
    
    If the machine has eight cards, use
-   
-         cd ../..
+
          bash launch_test_8card.sh
 
    The final output should be something like this. (ignoring all logs)

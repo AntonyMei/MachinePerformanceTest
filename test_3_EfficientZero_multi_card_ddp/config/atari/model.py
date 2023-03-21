@@ -6,15 +6,34 @@ import torch.nn as nn
 
 from core.model import BaseNet, renormalize
 
+import multiprocessing as mp
+import os
+import pickle
+import time
+from enum import Enum
+
+import SMOS
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+import torch.optim as optim
+from core.model import get_ddp_model_weights
+from core.storage_config import StorageConfig
+from torch.cuda.amp import GradScaler as GradScaler
+from torch.cuda.amp import autocast as autocast
+from torch.nn import L1Loss
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 def mlp(
-    input_size,
-    layer_sizes,
-    output_size,
-    output_activation=nn.Identity,
-    activation=nn.ReLU,
-    momentum=0.1,
-    init_zero=False,
+        input_size,
+        layer_sizes,
+        output_size,
+        output_activation=nn.Identity,
+        activation=nn.ReLU,
+        momentum=0.1,
+        init_zero=False,
 ):
     """MLP layers
     Parameters
@@ -47,6 +66,15 @@ def mlp(
         layers[-2].bias.data.fill_(0)
 
     return nn.Sequential(*layers)
+
+
+def consist_loss_func(f1, f2):
+    """Consistency loss function: similarity loss
+    Parameters
+    """
+    f1 = F.normalize(f1, p=2., dim=-1, eps=1e-5)
+    f2 = F.normalize(f2, p=2., dim=-1, eps=1e-5)
+    return -(f1 * f2).sum(dim=1)
 
 
 def conv3x3(in_channels, out_channels, stride=1):
@@ -107,7 +135,8 @@ class DownSample(nn.Module):
             padding=1,
             bias=False,
         )
-        self.downsample_block = ResidualBlock(out_channels // 2, out_channels, momentum=momentum, stride=2, downsample=self.conv2)
+        self.downsample_block = ResidualBlock(out_channels // 2, out_channels, momentum=momentum, stride=2,
+                                              downsample=self.conv2)
         self.resblocks2 = nn.ModuleList(
             [ResidualBlock(out_channels, out_channels, momentum=momentum) for _ in range(1)]
         )
@@ -136,12 +165,12 @@ class DownSample(nn.Module):
 # Encode the observations into hidden states
 class RepresentationNetwork(nn.Module):
     def __init__(
-        self,
-        observation_shape,
-        num_blocks,
-        num_channels,
-        downsample,
-        momentum=0.1,
+            self,
+            observation_shape,
+            num_blocks,
+            num_channels,
+            downsample,
+            momentum=0.1,
     ):
         """Representation network
         Parameters
@@ -194,16 +223,16 @@ class RepresentationNetwork(nn.Module):
 # Predict next hidden states given current states and actions
 class DynamicsNetwork(nn.Module):
     def __init__(
-        self,
-        num_blocks,
-        num_channels,
-        reduced_channels_reward,
-        fc_reward_layers,
-        full_support_size,
-        block_output_size_reward,
-        lstm_hidden_size=64,
-        momentum=0.1,
-        init_zero=False,
+            self,
+            num_blocks,
+            num_channels,
+            reduced_channels_reward,
+            fc_reward_layers,
+            full_support_size,
+            block_output_size_reward,
+            lstm_hidden_size=64,
+            momentum=0.1,
+            init_zero=False,
     ):
         """Dynamics network
         Parameters
@@ -242,10 +271,11 @@ class DynamicsNetwork(nn.Module):
         self.block_output_size_reward = block_output_size_reward
         self.lstm = nn.LSTM(input_size=self.block_output_size_reward, hidden_size=self.lstm_hidden_size)
         self.bn_value_prefix = nn.BatchNorm1d(self.lstm_hidden_size, momentum=momentum)
-        self.fc = mlp(self.lstm_hidden_size, fc_reward_layers, full_support_size, init_zero=init_zero, momentum=momentum)
+        self.fc = mlp(self.lstm_hidden_size, fc_reward_layers, full_support_size, init_zero=init_zero,
+                      momentum=momentum)
 
     def forward(self, x, reward_hidden):
-        state = x[:,:-1,:,:]
+        state = x[:, :-1, :, :]
         x = self.conv(x)
         x = self.bn(x)
 
@@ -291,19 +321,19 @@ class DynamicsNetwork(nn.Module):
 # predict the value and policy given hidden states
 class PredictionNetwork(nn.Module):
     def __init__(
-        self,
-        action_space_size,
-        num_blocks,
-        num_channels,
-        reduced_channels_value,
-        reduced_channels_policy,
-        fc_value_layers,
-        fc_policy_layers,
-        full_support_size,
-        block_output_size_value,
-        block_output_size_policy,
-        momentum=0.1,
-        init_zero=False,
+            self,
+            action_space_size,
+            num_blocks,
+            num_channels,
+            reduced_channels_value,
+            reduced_channels_policy,
+            fc_value_layers,
+            fc_policy_layers,
+            full_support_size,
+            block_output_size_value,
+            block_output_size_policy,
+            momentum=0.1,
+            init_zero=False,
     ):
         """Prediction network
         Parameters
@@ -342,8 +372,10 @@ class PredictionNetwork(nn.Module):
         self.bn_policy = nn.BatchNorm2d(reduced_channels_policy, momentum=momentum)
         self.block_output_size_value = block_output_size_value
         self.block_output_size_policy = block_output_size_policy
-        self.fc_value = mlp(self.block_output_size_value, fc_value_layers, full_support_size, init_zero=init_zero, momentum=momentum)
-        self.fc_policy = mlp(self.block_output_size_policy, fc_policy_layers, action_space_size, init_zero=init_zero, momentum=momentum)
+        self.fc_value = mlp(self.block_output_size_value, fc_value_layers, full_support_size, init_zero=init_zero,
+                            momentum=momentum)
+        self.fc_policy = mlp(self.block_output_size_policy, fc_policy_layers, action_space_size, init_zero=init_zero,
+                             momentum=momentum)
 
     def forward(self, x):
         for block in self.resblocks:
@@ -365,30 +397,30 @@ class PredictionNetwork(nn.Module):
 
 class EfficientZeroNet(BaseNet):
     def __init__(
-        self,
-        observation_shape,
-        action_space_size,
-        num_blocks,
-        num_channels,
-        reduced_channels_reward,
-        reduced_channels_value,
-        reduced_channels_policy,
-        fc_reward_layers,
-        fc_value_layers,
-        fc_policy_layers,
-        reward_support_size,
-        value_support_size,
-        downsample,
-        inverse_value_transform,
-        inverse_reward_transform,
-        lstm_hidden_size,
-        bn_mt=0.1,
-        proj_hid=256,
-        proj_out=256,
-        pred_hid=64,
-        pred_out=256,
-        init_zero=False,
-        state_norm=False
+            self,
+            observation_shape,
+            action_space_size,
+            num_blocks,
+            num_channels,
+            reduced_channels_reward,
+            reduced_channels_value,
+            reduced_channels_policy,
+            fc_reward_layers,
+            fc_value_layers,
+            fc_policy_layers,
+            reward_support_size,
+            value_support_size,
+            downsample,
+            inverse_value_transform,
+            inverse_reward_transform,
+            lstm_hidden_size,
+            bn_mt=0.1,
+            proj_hid=256,
+            proj_out=256,
+            pred_hid=64,
+            pred_out=256,
+            init_zero=False,
+            state_norm=False
     ):
         """EfficientZero network
         Parameters
@@ -451,9 +483,9 @@ class EfficientZeroNet(BaseNet):
         self.action_space_size = action_space_size
         block_output_size_reward = (
             (
-                reduced_channels_reward
-                * math.ceil(observation_shape[1] / 16)
-                * math.ceil(observation_shape[2] / 16)
+                    reduced_channels_reward
+                    * math.ceil(observation_shape[1] / 16)
+                    * math.ceil(observation_shape[2] / 16)
             )
             if downsample
             else (reduced_channels_reward * observation_shape[1] * observation_shape[2])
@@ -461,9 +493,9 @@ class EfficientZeroNet(BaseNet):
 
         block_output_size_value = (
             (
-                reduced_channels_value
-                * math.ceil(observation_shape[1] / 16)
-                * math.ceil(observation_shape[2] / 16)
+                    reduced_channels_value
+                    * math.ceil(observation_shape[1] / 16)
+                    * math.ceil(observation_shape[2] / 16)
             )
             if downsample
             else (reduced_channels_value * observation_shape[1] * observation_shape[2])
@@ -471,9 +503,9 @@ class EfficientZeroNet(BaseNet):
 
         block_output_size_policy = (
             (
-                reduced_channels_policy
-                * math.ceil(observation_shape[1] / 16)
-                * math.ceil(observation_shape[2] / 16)
+                    reduced_channels_policy
+                    * math.ceil(observation_shape[1] / 16)
+                    * math.ceil(observation_shape[2] / 16)
             )
             if downsample
             else (reduced_channels_policy * observation_shape[1] * observation_shape[2])
@@ -561,7 +593,7 @@ class EfficientZeroNet(BaseNet):
             .float()
         )
         action_one_hot = (
-            action[:, :, None, None] * action_one_hot / self.action_space_size
+                action[:, :, None, None] * action_one_hot / self.action_space_size
         )
         x = torch.cat((encoded_state, action_one_hot), dim=1)
         next_encoded_state, reward_hidden, value_prefix = self.dynamics_network(x, reward_hidden)
@@ -591,3 +623,126 @@ class EfficientZeroNet(BaseNet):
         else:
             return proj.detach()
 
+    def internal_forward(self,
+                         forward_type: str,
+                         obs=None,
+                         rank=None,
+                         hidden_state=None,
+                         reward_hidden=None,
+                         action=None,
+                         with_grad=None):
+        if forward_type == "initial_inference":
+            return self.initial_inference(obs=obs, rank=rank)
+        elif forward_type == "recurrent_inference":
+            return self.recurrent_inference(hidden_state=hidden_state, reward_hidden=reward_hidden,
+                                            action=action)
+        elif forward_type == "project":
+            return self.project(hidden_state=hidden_state, with_grad=with_grad)
+
+    def forward(self, action_batch, batch_size, config, mask_batch, metric_loss, obs_batch, obs_target_batch,
+                other_loss,
+                rank, target_policy, target_value, target_value_phi, target_value_prefix, target_value_prefix_phi,
+                vis_result):
+        with autocast():
+            # value, _, policy_logits, hidden_state, reward_hidden = model.module.initial_inference(obs_batch, rank)
+            value, _, policy_logits, hidden_state, reward_hidden = self.internal_forward(
+                forward_type="initial_inference",
+                obs=obs_batch,
+                rank=rank)
+        scaled_value = config.inverse_value_transform(value)
+        predicted_value_prefixs = []
+        # calculate the new priorities for each transition
+        value_priority = L1Loss(reduction='none')(scaled_value.squeeze(-1), target_value[:, 0])
+        value_priority = value_priority.data.cpu().numpy() + config.prioritized_replay_eps
+        # loss of the first step
+        value_loss = config.scalar_value_loss(value, target_value_phi[:, 0])
+        policy_loss = -(torch.log_softmax(policy_logits, dim=1) * target_policy[:, 0]).sum(1)
+        value_prefix_loss = torch.zeros(batch_size).to(rank)
+        consistency_loss = torch.zeros(batch_size).to(rank)
+        target_value_prefix_cpu = target_value_prefix.detach().cpu()
+        gradient_scale = 1 / config.num_unroll_steps
+        # loss of the unrolled steps
+        with autocast():
+            for step_i in range(config.num_unroll_steps):
+                # unroll with the dynamics function
+                # value, value_prefix, policy_logits, hidden_state, reward_hidden = model.module.recurrent_inference(
+                #     hidden_state, reward_hidden, action_batch[:, step_i])
+                value, value_prefix, policy_logits, hidden_state, reward_hidden = self.internal_forward(
+                    forward_type="recurrent_inference",
+                    hidden_state=hidden_state,
+                    reward_hidden=reward_hidden,
+                    action=action_batch[:, step_i])
+
+                beg_index = config.image_channel * step_i
+                end_index = config.image_channel * (step_i + config.stacked_observations)
+
+                # consistency loss
+                if config.consistency_coeff > 0:
+                    # obtain the oracle hidden states from representation function
+                    # _, _, _, presentation_state, _ = model.module.initial_inference(
+                    #     obs_target_batch[:, beg_index:end_index, :, :], rank)
+                    _, _, _, presentation_state, _ = self.internal_forward(
+                        forward_type="initial_inference",
+                        obs=obs_target_batch[:, beg_index:end_index, :, :],
+                        rank=rank)
+                    # no grad for the presentation_state branch
+                    # dynamic_proj = model.module.project(hidden_state, with_grad=True)
+                    # observation_proj = model.module.project(presentation_state, with_grad=False)
+                    dynamic_proj = self.internal_forward(forward_type="project",
+                                                         hidden_state=hidden_state,
+                                                         with_grad=True)
+                    observation_proj = self.internal_forward(forward_type="project",
+                                                             hidden_state=presentation_state,
+                                                             with_grad=False)
+                    temp_loss = consist_loss_func(dynamic_proj, observation_proj) * mask_batch[:, step_i]
+
+                    # TODO: remove this log item
+                    other_loss['consist_' + str(step_i + 1)] = 1.0
+                    consistency_loss += temp_loss
+
+                policy_loss += -(torch.log_softmax(policy_logits, dim=1) * target_policy[:, step_i + 1]).sum(1)
+                value_loss += config.scalar_value_loss(value, target_value_phi[:, step_i + 1])
+                value_prefix_loss += config.scalar_reward_loss(value_prefix, target_value_prefix_phi[:, step_i])
+                # Follow MuZero, set half gradient
+                hidden_state.register_hook(lambda grad: grad * 0.5)
+
+                # reset hidden states
+                if (step_i + 1) % config.lstm_horizon_len == 0:
+                    reward_hidden = (torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(rank),
+                                     torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(rank))
+
+                if vis_result:
+                    scaled_value_prefixs = config.inverse_reward_transform(value_prefix.detach())
+                    scaled_value_prefixs_cpu = scaled_value_prefixs.detach().cpu()
+
+                    predicted_values = torch.cat(
+                        (predicted_values, config.inverse_value_transform(value).detach().cpu()))
+                    predicted_value_prefixs.append(scaled_value_prefixs_cpu)
+                    predicted_policies = torch.cat(
+                        (predicted_policies, torch.softmax(policy_logits, dim=1).detach().cpu()))
+                    state_lst = np.concatenate((state_lst, hidden_state.detach().cpu().numpy()))
+
+                    key = 'unroll_' + str(step_i + 1) + '_l1'
+
+                    value_prefix_indices_0 = (target_value_prefix_cpu[:, step_i].unsqueeze(-1) == 0)
+                    value_prefix_indices_n1 = (target_value_prefix_cpu[:, step_i].unsqueeze(-1) == -1)
+                    value_prefix_indices_1 = (target_value_prefix_cpu[:, step_i].unsqueeze(-1) == 1)
+
+                    target_value_prefix_base = target_value_prefix_cpu[:, step_i].reshape(-1).unsqueeze(-1)
+
+                    other_loss[key] = metric_loss(scaled_value_prefixs_cpu, target_value_prefix_base)
+                    if value_prefix_indices_1.any():
+                        other_loss[key + '_1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_1],
+                                                             target_value_prefix_base[value_prefix_indices_1])
+                    if value_prefix_indices_n1.any():
+                        other_loss[key + '_-1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_n1],
+                                                              target_value_prefix_base[value_prefix_indices_n1])
+                    if value_prefix_indices_0.any():
+                        other_loss[key + '_0'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_0],
+                                                             target_value_prefix_base[value_prefix_indices_0])
+                else:
+                    predicted_policies = None
+                    predicted_values = None
+                    state_lst = None
+
+        return consistency_loss, policy_loss, predicted_policies, predicted_value_prefixs, predicted_values, state_lst, target_value_prefix_cpu, value_loss, value_prefix_loss, value_priority, gradient_scale

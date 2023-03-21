@@ -85,6 +85,7 @@ def update_weights(rank, model, batch, optimizer, config, scaler, smos_client, s
     vis_result: bool
         True -> log some visualization data in tensorboard (some distributions, values, etc)
     """
+    vis_result = False
     inputs_batch, targets_batch, worker_node_id = batch
     obs_batch_ori, action_batch, mask_batch, indices, weights_lst, make_time = inputs_batch
     target_value_prefix, target_value, target_policy = targets_batch
@@ -139,160 +140,9 @@ def update_weights(rank, model, batch, optimizer, config, scaler, smos_client, s
     transformed_target_value = config.scalar_transform(target_value)
     target_value_phi = config.value_phi(transformed_target_value)
 
-    if config.amp_type == 'torch_amp':
-        with autocast():
-            value, _, policy_logits, hidden_state, reward_hidden = model.module.initial_inference(obs_batch, rank)
-    else:
-        value, _, policy_logits, hidden_state, reward_hidden = model.module.initial_inference(obs_batch, rank)
-    scaled_value = config.inverse_value_transform(value)
-
-    if vis_result:
-        state_lst = hidden_state.detach().cpu().numpy()
-
-    predicted_value_prefixs = []
-    # Note: Following line is just for logging.
-    if vis_result:
-        predicted_values, predicted_policies = scaled_value.detach().cpu(), torch.softmax(policy_logits,
-                                                                                          dim=1).detach().cpu()
-
-    # calculate the new priorities for each transition
-    value_priority = L1Loss(reduction='none')(scaled_value.squeeze(-1), target_value[:, 0])
-    value_priority = value_priority.data.cpu().numpy() + config.prioritized_replay_eps
-
-    # loss of the first step
-    value_loss = config.scalar_value_loss(value, target_value_phi[:, 0])
-    policy_loss = -(torch.log_softmax(policy_logits, dim=1) * target_policy[:, 0]).sum(1)
-    value_prefix_loss = torch.zeros(batch_size).to(rank)
-    consistency_loss = torch.zeros(batch_size).to(rank)
-
-    target_value_prefix_cpu = target_value_prefix.detach().cpu()
-    gradient_scale = 1 / config.num_unroll_steps
-    # loss of the unrolled steps
-    if config.amp_type == 'torch_amp':
-        # use torch amp
-        with autocast():
-            for step_i in range(config.num_unroll_steps):
-                # unroll with the dynamics function
-                value, value_prefix, policy_logits, hidden_state, reward_hidden = model.module.recurrent_inference(
-                    hidden_state, reward_hidden, action_batch[:, step_i])
-
-                beg_index = config.image_channel * step_i
-                end_index = config.image_channel * (step_i + config.stacked_observations)
-
-                # consistency loss
-                if config.consistency_coeff > 0:
-                    # obtain the oracle hidden states from representation function
-                    _, _, _, presentation_state, _ = model.module.initial_inference(
-                        obs_target_batch[:, beg_index:end_index, :, :], rank)
-                    # no grad for the presentation_state branch
-                    dynamic_proj = model.module.project(hidden_state, with_grad=True)
-                    observation_proj = model.module.project(presentation_state, with_grad=False)
-                    temp_loss = consist_loss_func(dynamic_proj, observation_proj) * mask_batch[:, step_i]
-
-                    # TODO: remove this log item
-                    other_loss['consist_' + str(step_i + 1)] = 1.0
-                    consistency_loss += temp_loss
-
-                policy_loss += -(torch.log_softmax(policy_logits, dim=1) * target_policy[:, step_i + 1]).sum(1)
-                value_loss += config.scalar_value_loss(value, target_value_phi[:, step_i + 1])
-                value_prefix_loss += config.scalar_reward_loss(value_prefix, target_value_prefix_phi[:, step_i])
-                # Follow MuZero, set half gradient
-                hidden_state.register_hook(lambda grad: grad * 0.5)
-
-                # reset hidden states
-                if (step_i + 1) % config.lstm_horizon_len == 0:
-                    reward_hidden = (torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(rank),
-                                     torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(rank))
-
-                if vis_result:
-                    scaled_value_prefixs = config.inverse_reward_transform(value_prefix.detach())
-                    scaled_value_prefixs_cpu = scaled_value_prefixs.detach().cpu()
-
-                    predicted_values = torch.cat(
-                        (predicted_values, config.inverse_value_transform(value).detach().cpu()))
-                    predicted_value_prefixs.append(scaled_value_prefixs_cpu)
-                    predicted_policies = torch.cat(
-                        (predicted_policies, torch.softmax(policy_logits, dim=1).detach().cpu()))
-                    state_lst = np.concatenate((state_lst, hidden_state.detach().cpu().numpy()))
-
-                    key = 'unroll_' + str(step_i + 1) + '_l1'
-
-                    value_prefix_indices_0 = (target_value_prefix_cpu[:, step_i].unsqueeze(-1) == 0)
-                    value_prefix_indices_n1 = (target_value_prefix_cpu[:, step_i].unsqueeze(-1) == -1)
-                    value_prefix_indices_1 = (target_value_prefix_cpu[:, step_i].unsqueeze(-1) == 1)
-
-                    target_value_prefix_base = target_value_prefix_cpu[:, step_i].reshape(-1).unsqueeze(-1)
-
-                    other_loss[key] = metric_loss(scaled_value_prefixs_cpu, target_value_prefix_base)
-                    if value_prefix_indices_1.any():
-                        other_loss[key + '_1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_1],
-                                                             target_value_prefix_base[value_prefix_indices_1])
-                    if value_prefix_indices_n1.any():
-                        other_loss[key + '_-1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_n1],
-                                                              target_value_prefix_base[value_prefix_indices_n1])
-                    if value_prefix_indices_0.any():
-                        other_loss[key + '_0'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_0],
-                                                             target_value_prefix_base[value_prefix_indices_0])
-    else:
-        for step_i in range(config.num_unroll_steps):
-            # unroll with the dynamics function
-            value, value_prefix, policy_logits, hidden_state, reward_hidden = model.module.recurrent_inference(
-                hidden_state, reward_hidden, action_batch[:, step_i])
-
-            beg_index = config.image_channel * step_i
-            end_index = config.image_channel * (step_i + config.stacked_observations)
-
-            # consistency loss
-            if config.consistency_coeff > 0:
-                # obtain the oracle hidden states from representation function
-                _, _, _, presentation_state, _ = model.module.initial_inference(
-                    obs_target_batch[:, beg_index:end_index, :, :], rank)
-                # no grad for the presentation_state branch
-                dynamic_proj = model.module.project(hidden_state, with_grad=True)
-                observation_proj = model.module.project(presentation_state, with_grad=False)
-                temp_loss = consist_loss_func(dynamic_proj, observation_proj) * mask_batch[:, step_i]
-
-                other_loss['consist_' + str(step_i + 1)] = temp_loss.mean().item()
-                consistency_loss += temp_loss
-
-            policy_loss += -(torch.log_softmax(policy_logits, dim=1) * target_policy[:, step_i + 1]).sum(1)
-            value_loss += config.scalar_value_loss(value, target_value_phi[:, step_i + 1])
-            value_prefix_loss += config.scalar_reward_loss(value_prefix, target_value_prefix_phi[:, step_i])
-            # Follow MuZero, set half gradient
-            hidden_state.register_hook(lambda grad: grad * 0.5)
-
-            # reset hidden states
-            if (step_i + 1) % config.lstm_horizon_len == 0:
-                reward_hidden = (torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(rank),
-                                 torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(rank))
-
-            if vis_result:
-                scaled_value_prefixs = config.inverse_reward_transform(value_prefix.detach())
-                scaled_value_prefixs_cpu = scaled_value_prefixs.detach().cpu()
-
-                predicted_values = torch.cat((predicted_values, config.inverse_value_transform(value).detach().cpu()))
-                predicted_value_prefixs.append(scaled_value_prefixs_cpu)
-                predicted_policies = torch.cat((predicted_policies, torch.softmax(policy_logits, dim=1).detach().cpu()))
-                state_lst = np.concatenate((state_lst, hidden_state.detach().cpu().numpy()))
-
-                key = 'unroll_' + str(step_i + 1) + '_l1'
-
-                value_prefix_indices_0 = (target_value_prefix_cpu[:, step_i].unsqueeze(-1) == 0)
-                value_prefix_indices_n1 = (target_value_prefix_cpu[:, step_i].unsqueeze(-1) == -1)
-                value_prefix_indices_1 = (target_value_prefix_cpu[:, step_i].unsqueeze(-1) == 1)
-
-                target_value_prefix_base = target_value_prefix_cpu[:, step_i].reshape(-1).unsqueeze(-1)
-
-                other_loss[key] = metric_loss(scaled_value_prefixs_cpu, target_value_prefix_base)
-                if value_prefix_indices_1.any():
-                    other_loss[key + '_1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_1],
-                                                         target_value_prefix_base[value_prefix_indices_1])
-                if value_prefix_indices_n1.any():
-                    other_loss[key + '_-1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_n1],
-                                                          target_value_prefix_base[value_prefix_indices_n1])
-                if value_prefix_indices_0.any():
-                    other_loss[key + '_0'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_0],
-                                                         target_value_prefix_base[value_prefix_indices_0])
+    consistency_loss, policy_loss, predicted_policies, predicted_value_prefixs, predicted_values, state_lst, target_value_prefix_cpu, value_loss, value_prefix_loss, value_priority, gradient_scale = model(
+        action_batch, batch_size, config, mask_batch, metric_loss, obs_batch, obs_target_batch, other_loss, rank,
+        target_policy, target_value, target_value_phi, target_value_prefix, target_value_prefix_phi, vis_result)
     # ----------------------------------------------------------------------------------
     # weighted loss with masks (some invalid states which are out of trajectory.)
     loss = (config.consistency_coeff * consistency_loss + config.policy_loss_coeff * policy_loss +
@@ -387,7 +237,7 @@ def _train(rank, model, target_model, smos_client, config, storage_config: Stora
     """
     # ----------------------------------------------------------------------------------
     model = model.to(rank % storage_config.num_training_gpu)
-    model = DDP(model, device_ids=[rank % storage_config.num_training_gpu])
+    model = DDP(model, device_ids=[rank % storage_config.num_training_gpu], find_unused_parameters=True)
     target_model = target_model.to(rank % storage_config.num_training_gpu)
 
     optimizer = optim.SGD(model.parameters(), lr=config.lr_init, momentum=config.momentum,
